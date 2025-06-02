@@ -1,7 +1,8 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 
+// Types
 export interface NotificationChangeEvent {
     eventType: "CREATED" | "UPDATED" | "LATEST";
     ulid: string;
@@ -11,23 +12,172 @@ export interface NotificationChangeEvent {
 
 export interface NotificationEvent {
     type: "CREATED" | "UPDATED" | "LATEST" | "connection";
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    data: NotificationChangeEvent | any;
+    data: NotificationChangeEvent;
     time: Date;
 }
 
-export default function NotificationTest() {
+interface ConnectionStatus {
+    connected: boolean;
+    status: string;
+}
+
+// Constants
+const API_CONFIG = {
+    BASE_URL: "http://localhost:8080/v1/notification",
+    RECONNECT_DELAY: 5000,
+} as const;
+
+const EVENT_TYPES = {
+    CONNECTION: "connection",
+    LATEST_NOTIFICATION: "latest_notification",
+    CREATED: "CREATED",
+    UPDATED: "UPDATED",
+} as const;
+
+// Custom Hook for SSE Connection
+function useSSEConnection() {
     const [events, setEvents] = useState<NotificationEvent[]>([]);
-    const [connected, setConnected] = useState(false);
-    const [connectionStatus, setConnectionStatus] =
-        useState<string>("Disconnected");
+    const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({
+        connected: false,
+        status: "Disconnected",
+    });
     const [latestNotification, setLatestNotification] =
         useState<NotificationChangeEvent | null>(null);
     const eventSourceRef = useRef<EventSource | null>(null);
 
-    // EventSource 연결 초기화 함수
-    const initEventSource = () => {
-        // 기존 연결 정리
+    const addEvent = useCallback((event: NotificationEvent) => {
+        setEvents((prev) => [...prev, event]);
+    }, []);
+
+    const createEventSource = useCallback(() => {
+        const timestamp = new Date().getTime();
+        return new EventSource(
+            `${API_CONFIG.BASE_URL}/subscribe?_=${timestamp}`
+        );
+    }, []);
+
+    const handleConnectionOpen = useCallback(() => {
+        console.log("SSE connection opened");
+        setConnectionStatus({ connected: true, status: "Connected" });
+    }, []);
+
+    const handleConnectionEvent = useCallback((event: MessageEvent) => {
+        console.log("Connection event received:", event.data);
+        try {
+            const data = JSON.parse(event.data);
+            setConnectionStatus({
+                connected: true,
+                status: `Connected (${new Date(
+                    data.timestamp
+                ).toLocaleTimeString()})`,
+            });
+        } catch (error) {
+            console.error("Error parsing connection event:", error);
+        }
+    }, []);
+
+    const normalizeEventData = useCallback(
+        (
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            rawData: any,
+            eventType: NotificationChangeEvent["eventType"]
+        ): NotificationChangeEvent => {
+            return {
+                eventType,
+                ulid: rawData.ulid || "",
+                title: rawData.title || "",
+                content: rawData.content || "",
+            };
+        },
+        []
+    );
+
+    const handleNotificationEvent = useCallback(
+        (
+            event: MessageEvent,
+            eventType: NotificationChangeEvent["eventType"]
+        ) => {
+            console.log(`${eventType} event received:`, event.data);
+            try {
+                const rawData = JSON.parse(event.data);
+                const normalizedData = normalizeEventData(rawData, eventType);
+
+                if (eventType === "CREATED" || eventType === "LATEST") {
+                    setLatestNotification(normalizedData);
+                }
+
+                addEvent({
+                    type: eventType,
+                    data: normalizedData,
+                    time: new Date(),
+                });
+            } catch (error) {
+                console.error(
+                    `Error parsing ${eventType} event:`,
+                    error,
+                    "Raw data:",
+                    event.data
+                );
+            }
+        },
+        [normalizeEventData, addEvent]
+    );
+
+    const handleConnectionError = useCallback((error: Event) => {
+        console.error("SSE connection error:", error);
+        setConnectionStatus({ connected: false, status: "Connection Error" });
+
+        const eventSource = eventSourceRef.current;
+        if (eventSource?.readyState === EventSource.CLOSED) {
+            console.log(
+                `Connection closed, attempting to reconnect in ${
+                    API_CONFIG.RECONNECT_DELAY / 1000
+                } seconds...`
+            );
+            setTimeout(() => {
+                console.log("Attempting to reconnect...");
+                initConnection();
+            }, API_CONFIG.RECONNECT_DELAY);
+        }
+    }, []);
+
+    const setupEventListeners = useCallback(
+        (eventSource: EventSource) => {
+            eventSource.onopen = handleConnectionOpen;
+            eventSource.onerror = handleConnectionError;
+
+            eventSource.addEventListener(
+                EVENT_TYPES.CONNECTION,
+                handleConnectionEvent
+            );
+            eventSource.addEventListener(
+                EVENT_TYPES.LATEST_NOTIFICATION,
+                (event) => handleNotificationEvent(event, "LATEST")
+            );
+            eventSource.addEventListener(EVENT_TYPES.CREATED, (event) =>
+                handleNotificationEvent(event, "CREATED")
+            );
+            eventSource.addEventListener(EVENT_TYPES.UPDATED, (event) =>
+                handleNotificationEvent(event, "UPDATED")
+            );
+
+            eventSource.onmessage = (event) => {
+                console.log("Generic message event received:", event.data);
+                if (event.data && !event.data.includes("heartbeat")) {
+                    console.log("Processing generic message:", event.data);
+                }
+            };
+        },
+        [
+            handleConnectionOpen,
+            handleConnectionError,
+            handleConnectionEvent,
+            handleNotificationEvent,
+        ]
+    );
+
+    const initConnection = useCallback(() => {
+        // Clean up existing connection
         if (eventSourceRef.current) {
             eventSourceRef.current.close();
             eventSourceRef.current = null;
@@ -35,187 +185,34 @@ export default function NotificationTest() {
 
         try {
             console.log("Initializing EventSource connection...");
-
-            // 캐시 방지를 위한 타임스탬프 추가
-            const timestamp = new Date().getTime();
-            const eventSource = new EventSource(
-                `http://localhost:8080/v1/notification/subscribe?_=${timestamp}`
-            );
+            const eventSource = createEventSource();
             eventSourceRef.current = eventSource;
-
-            // 연결 상태 처리
-            eventSource.onopen = () => {
-                console.log("SSE connection opened");
-                setConnected(true);
-                setConnectionStatus("Connected");
-            };
-
-            // 연결 확인 이벤트 처리
-            eventSource.addEventListener(
-                "connection",
-                (event: MessageEvent) => {
-                    console.log("Connection event received:", event.data);
-                    try {
-                        const data = JSON.parse(event.data);
-                        setConnectionStatus(
-                            `Connected (${new Date(
-                                data.timestamp
-                            ).toLocaleTimeString()})`
-                        );
-                    } catch (error) {
-                        console.error("Error parsing connection event:", error);
-                    }
-                }
-            );
-
-            // LATEST 이벤트 처리 (클라이언트 연결 시 최신 알림)
-            eventSource.addEventListener(
-                "latest_notification",
-                (event: MessageEvent) => {
-                    console.log(
-                        "LATEST notification event received:",
-                        event.data
-                    );
-                    try {
-                        const rawData = JSON.parse(event.data);
-                        console.log("Parsed LATEST data:", rawData);
-
-                        const normalizedData: NotificationChangeEvent = {
-                            eventType: "LATEST",
-                            ulid: rawData.ulid || "",
-                            title: rawData.title || "",
-                            content: rawData.content || "",
-                        };
-
-                        // 최신 알림 상태 업데이트
-                        setLatestNotification(normalizedData);
-
-                        // 이벤트 목록에도 추가
-                        setEvents((prev) => {
-                            const newEvent = {
-                                type: "LATEST" as const,
-                                data: normalizedData,
-                                time: new Date(),
-                            };
-                            console.log(
-                                "Adding LATEST event to state:",
-                                newEvent
-                            );
-                            return [...prev, newEvent];
-                        });
-                    } catch (error) {
-                        console.error(
-                            "Error parsing LATEST event:",
-                            error,
-                            "Raw data:",
-                            event.data
-                        );
-                    }
-                }
-            );
-
-            // CREATED 이벤트 처리
-            eventSource.addEventListener("CREATED", (event: MessageEvent) => {
-                console.log("CREATED event received:", event.data);
-                try {
-                    const rawData = JSON.parse(event.data);
-                    console.log("Parsed CREATED data:", rawData);
-
-                    const normalizedData: NotificationChangeEvent = {
-                        eventType: "CREATED",
-                        ulid: rawData.ulid || "",
-                        title: rawData.title || "",
-                        content: rawData.content || "",
-                    };
-
-                    // 새로 생성된 알림이므로 최신 알림으로도 업데이트
-                    setLatestNotification(normalizedData);
-
-                    setEvents((prev) => {
-                        const newEvent = {
-                            type: "CREATED" as const,
-                            data: normalizedData,
-                            time: new Date(),
-                        };
-                        console.log("Adding CREATED event to state:", newEvent);
-                        return [...prev, newEvent];
-                    });
-                } catch (error) {
-                    console.error(
-                        "Error parsing CREATED event:",
-                        error,
-                        "Raw data:",
-                        event.data
-                    );
-                }
-            });
-
-            // UPDATED 이벤트 처리
-            eventSource.addEventListener("UPDATED", (event: MessageEvent) => {
-                console.log("UPDATED event received:", event.data);
-                try {
-                    const rawData = JSON.parse(event.data);
-
-                    const normalizedData: NotificationChangeEvent = {
-                        eventType: "UPDATED",
-                        ulid: rawData.ulid || "",
-                        title: rawData.title || "",
-                        content: rawData.content || "",
-                    };
-
-                    setEvents((prev) => {
-                        const newEvent = {
-                            type: "UPDATED" as const,
-                            data: normalizedData,
-                            time: new Date(),
-                        };
-                        console.log("Adding UPDATED event to state:", newEvent);
-                        return [...prev, newEvent];
-                    });
-                } catch (error) {
-                    console.error("Error parsing UPDATED event:", error);
-                }
-            });
-
-            // 일반 message 이벤트 처리 (fallback)
-            eventSource.onmessage = (event) => {
-                console.log("Generic message event received:", event.data);
-                // 특정 이벤트 타입으로 처리되지 않은 메시지들을 여기서 처리
-                if (event.data && !event.data.includes("heartbeat")) {
-                    console.log("Processing generic message:", event.data);
-                }
-            };
-
-            // 에러 처리
-            eventSource.onerror = (error) => {
-                console.error("SSE connection error:", error);
-                setConnected(false);
-                setConnectionStatus("Connection Error");
-
-                // 연결이 끊어지면 5초 후 재연결 시도
-                if (eventSource.readyState === EventSource.CLOSED) {
-                    console.log(
-                        "Connection closed, attempting to reconnect in 5 seconds..."
-                    );
-                    setTimeout(() => {
-                        console.log("Attempting to reconnect...");
-                        initEventSource();
-                    }, 5000);
-                }
-            };
+            setupEventListeners(eventSource);
         } catch (connectionError) {
             console.error("Failed to create EventSource:", connectionError);
-            setConnected(false);
-            setConnectionStatus("Connection Failed");
+            setConnectionStatus({
+                connected: false,
+                status: "Connection Failed",
+            });
         }
-    };
+    }, [createEventSource, setupEventListeners]);
 
-    // 컴포넌트 마운트 시 EventSource 초기화
+    const refreshConnection = useCallback(() => {
+        console.log("Refreshing connection...");
+        setLatestNotification(null);
+        initConnection();
+    }, [initConnection]);
+
+    const clearEvents = useCallback(() => {
+        console.log("Clearing events...");
+        setEvents([]);
+        setLatestNotification(null);
+    }, []);
+
     useEffect(() => {
         console.log("Component mounted, initializing EventSource");
-        initEventSource();
+        initConnection();
 
-        // 컴포넌트 언마운트 시 정리
         return () => {
             console.log("Component unmounting, cleaning up EventSource");
             if (eventSourceRef.current) {
@@ -223,27 +220,33 @@ export default function NotificationTest() {
                 eventSourceRef.current = null;
             }
         };
-    }, []);
+    }, [initConnection]);
 
-    const createNotification = async () => {
+    return {
+        events,
+        connectionStatus,
+        latestNotification,
+        refreshConnection,
+        clearEvents,
+    };
+}
+
+// Custom Hook for Notification API
+function useNotificationAPI() {
+    const createNotification = useCallback(async () => {
         console.log("Creating test notification...");
         try {
-            const response = await fetch(
-                "http://localhost:8080/v1/notification/create",
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({
-                        title: "Test Notification",
-                        content:
-                            "This is a test at " +
-                            new Date().toLocaleTimeString(),
-                        locale: "ko",
-                    }),
-                }
-            );
+            const response = await fetch(`${API_CONFIG.BASE_URL}/create`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    title: "Test Notification",
+                    content: `This is a test at ${new Date().toLocaleTimeString()}`,
+                    locale: "ko",
+                }),
+            });
 
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
@@ -254,153 +257,215 @@ export default function NotificationTest() {
         } catch (error) {
             console.error("Failed to create notification:", error);
         }
+    }, []);
+
+    return { createNotification };
+}
+
+// UI Components
+interface ConnectionStatusProps {
+    connectionStatus: ConnectionStatus;
+}
+
+function ConnectionStatusDisplay({ connectionStatus }: ConnectionStatusProps) {
+    return (
+        <div className="mb-4 p-4 bg-gray-100 rounded">
+            <p className="mb-2">
+                <strong>Connection Status:</strong>{" "}
+                {connectionStatus.connected ? "✅" : "❌"}{" "}
+                {connectionStatus.status}
+            </p>
+            <p className="text-sm text-gray-600">
+                Check browser console for detailed logs
+            </p>
+        </div>
+    );
+}
+
+interface LatestNotificationProps {
+    notification: NotificationChangeEvent;
+}
+
+function LatestNotificationCard({ notification }: LatestNotificationProps) {
+    return (
+        <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded">
+            <h3 className="text-lg font-semibold mb-2 text-yellow-800">
+                📢 Latest Notification
+            </h3>
+            <EventDataDisplay data={notification} />
+        </div>
+    );
+}
+
+interface EventDataDisplayProps {
+    data: NotificationChangeEvent;
+}
+
+function EventDataDisplay({ data }: EventDataDisplayProps) {
+    return (
+        <div className="bg-white p-2 rounded border">
+            <p>
+                <strong>Type:</strong> {data.eventType || "N/A"}
+            </p>
+            <p>
+                <strong>ULID:</strong> {data.ulid || "N/A"}
+            </p>
+            {data.title && (
+                <p>
+                    <strong>Title:</strong> {data.title}
+                </p>
+            )}
+            {data.content && (
+                <p>
+                    <strong>Content:</strong> {data.content}
+                </p>
+            )}
+            <details>
+                <summary className="cursor-pointer text-sm text-blue-500">
+                    Raw Data
+                </summary>
+                <pre className="text-xs overflow-auto mt-2 p-2 bg-gray-100 rounded">
+                    {JSON.stringify(data, null, 2)}
+                </pre>
+            </details>
+        </div>
+    );
+}
+
+interface ControlButtonsProps {
+    connected: boolean;
+    onCreateNotification: () => void;
+    onRefreshConnection: () => void;
+    onClearEvents: () => void;
+}
+
+function ControlButtons({
+    connected,
+    onCreateNotification,
+    onRefreshConnection,
+    onClearEvents,
+}: ControlButtonsProps) {
+    return (
+        <div className="mb-4 flex flex-wrap gap-2">
+            <button
+                onClick={onCreateNotification}
+                className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-blue-300"
+                disabled={!connected}
+            >
+                Create Test Notification
+            </button>
+            <button
+                onClick={onRefreshConnection}
+                className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
+            >
+                Refresh Connection
+            </button>
+            <button
+                onClick={onClearEvents}
+                className="px-4 py-2 bg-yellow-500 text-white rounded hover:bg-yellow-600"
+            >
+                Clear Events
+            </button>
+            <button
+                onClick={() => window.location.reload()}
+                className="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600"
+            >
+                Reload Page
+            </button>
+        </div>
+    );
+}
+
+interface EventListProps {
+    events: NotificationEvent[];
+}
+
+function EventList({ events }: EventListProps) {
+    const getEventStyles = (eventType: string) => {
+        const styles = {
+            CREATED: "bg-green-50 border-green-200 text-green-600",
+            UPDATED: "bg-blue-50 border-blue-200 text-blue-600",
+            LATEST: "bg-orange-50 border-orange-200 text-orange-600",
+            default: "bg-gray-50 text-gray-600",
+        };
+        return styles[eventType as keyof typeof styles] || styles.default;
     };
 
-    // 연결 새로고침
-    const refreshConnection = () => {
-        console.log("Refreshing connection...");
-        setLatestNotification(null); // 최신 알림도 초기화
-        initEventSource();
-    };
-
-    // 이벤트 초기화
-    const clearEvents = () => {
-        console.log("Clearing events...");
-        setEvents([]);
-        setLatestNotification(null);
-    };
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const renderEventData = (data: NotificationChangeEvent | any) => {
+    if (events.length === 0) {
         return (
-            <div className="bg-white p-2 rounded border">
-                <p>
-                    <strong>Type:</strong> {data.eventType || "N/A"}
-                </p>
-                <p>
-                    <strong>ULID:</strong> {data.ulid || "N/A"}
-                </p>
-                {data.title && (
-                    <p>
-                        <strong>Title:</strong> {data.title}
-                    </p>
-                )}
-                {data.content && (
-                    <p>
-                        <strong>Content:</strong> {data.content}
-                    </p>
-                )}
-                <details>
-                    <summary className="cursor-pointer text-sm text-blue-500">
-                        Raw Data
-                    </summary>
-                    <pre className="text-xs overflow-auto mt-2 p-2 bg-gray-100 rounded">
-                        {JSON.stringify(data, null, 2)}
-                    </pre>
-                </details>
+            <div className="max-h-96 overflow-auto border rounded p-2">
+                <p className="text-gray-500">No events yet...</p>
             </div>
         );
-    };
+    }
+
+    return (
+        <div className="max-h-96 overflow-auto border rounded p-2">
+            {events
+                .slice()
+                .reverse() // 최신 이벤트를 맨 위에 표시
+                .map((event, index) => {
+                    const eventStyles = getEventStyles(event.type);
+                    const [bgColor, borderColor, textColor] =
+                        eventStyles.split(" ");
+
+                    return (
+                        <div
+                            key={index}
+                            className={`mb-2 p-3 border rounded ${bgColor} ${borderColor}`}
+                        >
+                            <div className="flex justify-between items-center mb-2">
+                                <strong className={textColor}>
+                                    {event.type}
+                                    {event.type === "LATEST" &&
+                                        " (Initial Load)"}
+                                </strong>
+                                <span className="text-sm text-gray-500">
+                                    {event.time.toLocaleTimeString()}
+                                </span>
+                            </div>
+                            <EventDataDisplay data={event.data} />
+                        </div>
+                    );
+                })}
+        </div>
+    );
+}
+
+// Main Component
+export default function NotificationTest() {
+    const {
+        events,
+        connectionStatus,
+        latestNotification,
+        refreshConnection,
+        clearEvents,
+    } = useSSEConnection();
+
+    const { createNotification } = useNotificationAPI();
 
     return (
         <div className="p-4">
             <h2 className="text-2xl font-bold mb-4">Notification Test</h2>
-            <div className="mb-4 p-4 bg-gray-100 rounded">
-                <p className="mb-2">
-                    <strong>Connection Status:</strong>{" "}
-                    {connected ? "✅" : "❌"} {connectionStatus}
-                </p>
-                <p className="text-sm text-gray-600">
-                    Check browser console for detailed logs
-                </p>
-            </div>
 
-            {/* 최신 알림 표시 섹션 */}
+            <ConnectionStatusDisplay connectionStatus={connectionStatus} />
+
             {latestNotification && (
-                <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded">
-                    <h3 className="text-lg font-semibold mb-2 text-yellow-800">
-                        📢 Latest Notification
-                    </h3>
-                    {renderEventData(latestNotification)}
-                </div>
+                <LatestNotificationCard notification={latestNotification} />
             )}
 
-            <div className="mb-4 flex flex-wrap gap-2">
-                <button
-                    onClick={createNotification}
-                    className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-blue-300"
-                    disabled={!connected}
-                >
-                    Create Test Notification
-                </button>
-                <button
-                    onClick={refreshConnection}
-                    className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
-                >
-                    Refresh Connection
-                </button>
-                <button
-                    onClick={clearEvents}
-                    className="px-4 py-2 bg-yellow-500 text-white rounded hover:bg-yellow-600"
-                >
-                    Clear Events
-                </button>
-                <button
-                    onClick={() => window.location.reload()}
-                    className="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600"
-                >
-                    Reload Page
-                </button>
-            </div>
+            <ControlButtons
+                connected={connectionStatus.connected}
+                onCreateNotification={createNotification}
+                onRefreshConnection={refreshConnection}
+                onClearEvents={clearEvents}
+            />
 
             <h3 className="text-xl font-semibold mb-2">
                 Events: {events.length}
             </h3>
-            <div className="max-h-96 overflow-auto border rounded p-2">
-                {events.length === 0 ? (
-                    <p className="text-gray-500">No events yet...</p>
-                ) : (
-                    events
-                        .slice()
-                        .reverse() // 최신 이벤트를 맨 위에 표시
-                        .map((event, index) => (
-                            <div
-                                key={index}
-                                className={`mb-2 p-3 border rounded ${
-                                    event.type === "CREATED"
-                                        ? "bg-green-50 border-green-200"
-                                        : event.type === "UPDATED"
-                                        ? "bg-blue-50 border-blue-200"
-                                        : event.type === "LATEST"
-                                        ? "bg-orange-50 border-orange-200"
-                                        : "bg-gray-50"
-                                }`}
-                            >
-                                <div className="flex justify-between items-center mb-2">
-                                    <strong
-                                        className={`${
-                                            event.type === "CREATED"
-                                                ? "text-green-600"
-                                                : event.type === "UPDATED"
-                                                ? "text-blue-600"
-                                                : event.type === "LATEST"
-                                                ? "text-orange-600"
-                                                : "text-gray-600"
-                                        }`}
-                                    >
-                                        {event.type}
-                                        {event.type === "LATEST" &&
-                                            " (Initial Load)"}
-                                    </strong>
-                                    <span className="text-sm text-gray-500">
-                                        {event.time.toLocaleTimeString()}
-                                    </span>
-                                </div>
-                                {renderEventData(event.data)}
-                            </div>
-                        ))
-                )}
-            </div>
+
+            <EventList events={events} />
         </div>
     );
 }
