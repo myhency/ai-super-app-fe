@@ -3,14 +3,14 @@
 import React, { useState, useEffect, useRef } from "react";
 
 export interface NotificationChangeEvent {
-    eventType: "CREATED" | "UPDATED";
+    eventType: "CREATED" | "UPDATED" | "LATEST";
     ulid: string;
     title?: string;
     content?: string;
 }
 
 export interface NotificationEvent {
-    type: "CREATED" | "UPDATED" | "connection";
+    type: "CREATED" | "UPDATED" | "LATEST" | "connection";
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     data: NotificationChangeEvent | any;
     time: Date;
@@ -21,6 +21,8 @@ export default function NotificationTest() {
     const [connected, setConnected] = useState(false);
     const [connectionStatus, setConnectionStatus] =
         useState<string>("Disconnected");
+    const [latestNotification, setLatestNotification] =
+        useState<NotificationChangeEvent | null>(null);
     const eventSourceRef = useRef<EventSource | null>(null);
 
     // EventSource 연결 초기화 함수
@@ -66,6 +68,52 @@ export default function NotificationTest() {
                 }
             );
 
+            // LATEST 이벤트 처리 (클라이언트 연결 시 최신 알림)
+            eventSource.addEventListener(
+                "latest_notification",
+                (event: MessageEvent) => {
+                    console.log(
+                        "LATEST notification event received:",
+                        event.data
+                    );
+                    try {
+                        const rawData = JSON.parse(event.data);
+                        console.log("Parsed LATEST data:", rawData);
+
+                        const normalizedData: NotificationChangeEvent = {
+                            eventType: "LATEST",
+                            ulid: rawData.ulid || "",
+                            title: rawData.title || "",
+                            content: rawData.content || "",
+                        };
+
+                        // 최신 알림 상태 업데이트
+                        setLatestNotification(normalizedData);
+
+                        // 이벤트 목록에도 추가
+                        setEvents((prev) => {
+                            const newEvent = {
+                                type: "LATEST" as const,
+                                data: normalizedData,
+                                time: new Date(),
+                            };
+                            console.log(
+                                "Adding LATEST event to state:",
+                                newEvent
+                            );
+                            return [...prev, newEvent];
+                        });
+                    } catch (error) {
+                        console.error(
+                            "Error parsing LATEST event:",
+                            error,
+                            "Raw data:",
+                            event.data
+                        );
+                    }
+                }
+            );
+
             // CREATED 이벤트 처리
             eventSource.addEventListener("CREATED", (event: MessageEvent) => {
                 console.log("CREATED event received:", event.data);
@@ -79,6 +127,9 @@ export default function NotificationTest() {
                         title: rawData.title || "",
                         content: rawData.content || "",
                     };
+
+                    // 새로 생성된 알림이므로 최신 알림으로도 업데이트
+                    setLatestNotification(normalizedData);
 
                     setEvents((prev) => {
                         const newEvent = {
@@ -208,6 +259,7 @@ export default function NotificationTest() {
     // 연결 새로고침
     const refreshConnection = () => {
         console.log("Refreshing connection...");
+        setLatestNotification(null); // 최신 알림도 초기화
         initEventSource();
     };
 
@@ -215,6 +267,7 @@ export default function NotificationTest() {
     const clearEvents = () => {
         console.log("Clearing events...");
         setEvents([]);
+        setLatestNotification(null);
     };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -262,6 +315,16 @@ export default function NotificationTest() {
                 </p>
             </div>
 
+            {/* 최신 알림 표시 섹션 */}
+            {latestNotification && (
+                <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded">
+                    <h3 className="text-lg font-semibold mb-2 text-yellow-800">
+                        📢 Latest Notification
+                    </h3>
+                    {renderEventData(latestNotification)}
+                </div>
+            )}
+
             <div className="mb-4 flex flex-wrap gap-2">
                 <button
                     onClick={createNotification}
@@ -308,6 +371,8 @@ export default function NotificationTest() {
                                         ? "bg-green-50 border-green-200"
                                         : event.type === "UPDATED"
                                         ? "bg-blue-50 border-blue-200"
+                                        : event.type === "LATEST"
+                                        ? "bg-orange-50 border-orange-200"
                                         : "bg-gray-50"
                                 }`}
                             >
@@ -318,10 +383,14 @@ export default function NotificationTest() {
                                                 ? "text-green-600"
                                                 : event.type === "UPDATED"
                                                 ? "text-blue-600"
+                                                : event.type === "LATEST"
+                                                ? "text-orange-600"
                                                 : "text-gray-600"
                                         }`}
                                     >
                                         {event.type}
+                                        {event.type === "LATEST" &&
+                                            " (Initial Load)"}
                                     </strong>
                                     <span className="text-sm text-gray-500">
                                         {event.time.toLocaleTimeString()}
